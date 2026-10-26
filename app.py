@@ -6,6 +6,7 @@ Qiita「RocketCEAでロケットエンジン性能計算」(ina111) のサンプ
 
 import hashlib
 import re
+import threading
 
 import numpy as np
 import pandas as pd
@@ -21,6 +22,16 @@ from rocketcea.cea_obj_w_units import CEA_Obj
 from rocketcea.input_cards import fuelCards, oxCards
 
 G0 = 9.80665
+
+
+@st.cache_resource
+def _cea_lock():
+    # RocketCEA は Fortran の共有状態 (COMMON ブロックや結果キャッシュ) を使うため、複数セッションが同時に
+    # 計算すると互いの値を上書きして誤った値や nan になる。全セッションで共有するロックで 1 件ずつ実行する
+    return threading.RLock()
+
+
+CEA_LOCK = _cea_lock()
 
 
 def fnum(v):
@@ -172,8 +183,9 @@ h,kj/mol=62.63     t(k)=298.15  rho.g/cc=1.05"""
 
 @st.cache_resource(show_spinner=False)
 def register_extra_fuels():
-    add_new_fuel("ABS", ABS_CARD)
-    add_prop_sg("ABS", 1.05)  # 推進剤比較 (かさ密度) 用
+    with CEA_LOCK:
+        add_new_fuel("ABS", ABS_CARD)
+        add_prop_sg("ABS", 1.05)  # 推進剤比較 (かさ密度) 用
     return True
 
 
@@ -426,10 +438,26 @@ UNITS = dict(cstar_units="m/s", pressure_units="MPa", temperature_units="K",
 
 @st.cache_resource(show_spinner=False)
 def get_cea(propName, oxName, fuelName, fac_CR, cards):
-    for kind, name, card in cards:
-        {"ox": add_new_oxidizer, "fuel": add_new_fuel, "prop": add_new_propellant}[kind](name, card)
-    kw = dict(propName=propName, oxName=oxName, fuelName=fuelName, fac_CR=fac_CR)
-    return CEA_Obj(**kw, **UNITS), CEA_Obj_raw(**kw)
+    with CEA_LOCK:
+        for kind, name, card in cards:
+            {"ox": add_new_oxidizer, "fuel": add_new_fuel, "prop": add_new_propellant}[kind](name, card)
+        kw = dict(propName=propName, oxName=oxName, fuelName=fuelName, fac_CR=fac_CR)
+        return CEA_Obj(**kw, **UNITS), CEA_Obj_raw(**kw)
+
+
+def _purge_nan_cache():
+    """RocketCEA の結果キャッシュから nan の項目だけを消す。
+    (clearCache() はキャッシュ表そのものを消してしまい、以後 get_Isp / get_Cstar が全部失敗するので使わない)"""
+    for cache in cea_mod.getCacheDict().values():
+        for d in (cache.ispDict, cache.cstarDict, cache.tcDict):
+            for key in [k for k, v in d.items() if isinstance(v, float) and v != v]:
+                del d[key]
+
+
+def cea_call(f, *a, **k):
+    """RocketCEA の呼び出しは必ずこれを通す (全セッション共通のロックで 1 件ずつ実行)"""
+    with CEA_LOCK:
+        return f(*a, **k)
 
 
 cards = []
@@ -465,13 +493,13 @@ COLORS = pc.qualitative.Plotly
 def safe(f, *a, **k):
     for attempt in range(2):
         try:
-            v = f(*a, **k)
+            v = cea_call(f, *a, **k)
             v = v[0] if isinstance(v, tuple) else v
         except Exception:
             return np.nan
-        # RocketCEA は一度 nan になった結果をキャッシュして返し続けるので、キャッシュを捨てて 1 回だけ再計算する
+        # RocketCEA は一度 nan になった結果をキャッシュして返し続けるので、nan の記録だけ消して 1 回だけ再計算する
         if attempt == 0 and isinstance(v, float) and np.isnan(v):
-            cea_mod.clearCache(show_size=False)
+            cea_call(_purge_nan_cache)
             continue
         return v
     return v
@@ -508,7 +536,7 @@ m = st.columns(7)
 isp_vac = safe(cea.get_Isp, Pc, MRv, eps, **FZ)
 isp_sl = isp_amb(Pc, MRv, eps)
 try:
-    _, _, Tc, mw, gam = cea.get_IvacCstrTc_ChmMwGam(Pc=Pc, MR=MRv, eps=eps)
+    _, _, Tc, mw, gam = cea_call(cea.get_IvacCstrTc_ChmMwGam, Pc=Pc, MR=MRv, eps=eps)
 except Exception:
     Tc = mw = gam = np.nan
 cstar = safe(cea.get_Cstar, Pc, MRv)
@@ -529,7 +557,7 @@ tabs = st.tabs(["① CEA 出力", "② 性能特性", "③ 平衡流 / 凍結流
 with tabs[0]:
     short = st.toggle("短縮出力 (short_output)", value=True)
     with st.spinner("CEA 計算中..."):
-        out = cea_raw.get_full_cea_output(Pc=Pc * 10.0, MR=MRv, eps=eps, short_output=int(short),
+        out = cea_call(cea_raw.get_full_cea_output, Pc=Pc * 10.0, MR=MRv, eps=eps, short_output=int(short),
                                           pc_units="bar", output="siunits", fac_CR=fac_CR, **FZ)
     st.code(out, language=None)
     st.download_button("テキストを保存", out, file_name="cea_output.txt")
@@ -553,7 +581,7 @@ PEAK_COLS = {"Isp_vac", "Isp_SL", "cstar"}  # グラフに頂点マークを付�
 def perf_point(Pc_, MR_, eps_, obj=None):
     obj = obj or cea
     try:
-        _, cs, tc, mw_, g = obj.get_IvacCstrTc_ChmMwGam(Pc=Pc_, MR=MR_, eps=eps_)
+        _, cs, tc, mw_, g = cea_call(obj.get_IvacCstrTc_ChmMwGam, Pc=Pc_, MR=MR_, eps=eps_)
     except Exception:
         cs = tc = mw_ = g = np.nan
     return dict(Isp_vac=safe(obj.get_Isp, Pc_, MR_, eps_, **FZ), Isp_SL=isp_amb(Pc_, MR_, eps_, obj),
@@ -748,7 +776,7 @@ def show_comparison():
         for j, pair in enumerate(cmp_pairs):
             o, f = [s.strip() for s in pair.split("/")]
             try:
-                lim = MR_Temperature_Limits(oxName=o, fuelName=f, MR_MAX=20.0)
+                lim = cea_call(MR_Temperature_Limits, oxName=o, fuelName=f, MR_MAX=20.0)
                 mr_min = max(lim.min_MR, 1.0)
                 mrs = np.arange(mr_min, lim.max_MR, 0.1)
                 rho = np.asarray(bulkDensity(o, f, mrs)) * 1000.0
