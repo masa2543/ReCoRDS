@@ -1,0 +1,5 @@
+rocketcea==1.2.3
+streamlit==1.66.1
+plotly==7.1.0
+numpy==2.5.4
+pandas==3.1.0
